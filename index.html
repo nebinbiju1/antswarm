@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Ant Swarm</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Serif:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #FFE88E;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      user-select: none;
+      font-family: 'Courier New', monospace;
+    }
+    canvas { display: block; cursor: crosshair; }
+    #ui {
+      font-family: 'Roboto Serif', serif;
+      font-size: 15px;
+      color: #444;
+      opacity: 0.8;
+      margin-top: 7px;
+      letter-spacing: 0.8px;
+    }
+    #ui span { margin: 0 14px; }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="ui">
+    <span>DRAG — draw wall</span>
+    <span>RIGHT DRAG — erase</span>
+    <span id="count"></span>
+  </div>
+
+  <script>
+  const canvas = document.getElementById('canvas');
+  const ctx    = canvas.getContext('2d');
+  const W = canvas.width  = Math.min(window.innerWidth,       0.2 * window.innerWidth         + 1024);
+  const H = canvas.height = Math.min(window.innerHeight - 40,  0.2 * (window.innerHeight - 40) + 576);
+
+  // ── Pheromone grid ────────────────────────────────────────────
+  const CELL = 4;
+  const GW   = Math.ceil(W / CELL);
+  const GH   = Math.ceil(H / CELL);
+  const trail    = new Float32Array(GW * GH);
+  const trailBuf = new Float32Array(GW * GH);
+  const EVAP  = 0.991;
+  const KDIFF = 0.14;
+  const DEP   = 10;
+  const TMAX  = 100;
+
+  const obs = new Uint8Array(GW * GH);
+
+  function trailAt(gx, gy) {
+    if (gx < 0 || gx >= GW || gy < 0 || gy >= GH) return 0;
+    if (obs[gy * GW + gx]) return 0;
+    return trail[gy * GW + gx];
+  }
+  function sampleTrail(x, y) {
+    return trailAt((x / CELL) | 0, (y / CELL) | 0);
+  }
+  function depositAt(x, y) {
+    const gx = (x / CELL) | 0, gy = (y / CELL) | 0;
+    if (gx < 0 || gx >= GW || gy < 0 || gy >= GH) return;
+    const i = gy * GW + gx;
+    if (!obs[i]) trail[i] = Math.min(trail[i] + DEP, TMAX);
+  }
+  function stepTrail() {
+    for (let gy = 0; gy < GH; gy++) {
+      for (let gx = 0; gx < GW; gx++) {
+        const i = gy * GW + gx;
+        if (obs[i]) { trailBuf[i] = 0; continue; }
+        const c  = trail[i] * (1 - KDIFF);
+        const nb = (trailAt(gx-1,gy)+trailAt(gx+1,gy)+
+                    trailAt(gx,gy-1)+trailAt(gx,gy+1)) * (KDIFF / 4);
+        trailBuf[i] = (c + nb) * EVAP;
+      }
+    }
+    trail.set(trailBuf);
+  }
+
+  // ── Obstacles ─────────────────────────────────────────────────
+  const OBW = 5, OBH = 5;
+  function editObs(px, py, fill) {
+    const cx = (px / CELL) | 0, cy = (py / CELL) | 0;
+    for (let r = -OBH; r <= OBH; r++) {
+      for (let c = -OBW; c <= OBW; c++) {
+        const gx = cx+c, gy = cy+r;
+        if (gx >= 0 && gx < GW && gy >= 0 && gy < GH) {
+          obs[gy*GW+gx] = fill;
+          trail[gy*GW+gx] = 0;
+        }
+      }
+    }
+  }
+  function isObs(x, y) {
+    if (x < 0 || x >= W || y < 0 || y >= H) return true;
+    return obs[((y / CELL) | 0) * GW + ((x / CELL) | 0)] === 1;
+  }
+
+  // ── Ants ──────────────────────────────────────────────────────
+  const N         = 60;
+  const SD        = 22;
+  const SA        = Math.PI / 5;
+  const RA        = 0.38;
+  const SPD       = 2.0;
+  const SPAWN_ITV = 22;
+  const MAX_STUCK = 250;
+
+  const ax       = new Float32Array(N);
+  const ay       = new Float32Array(N);
+  const aθ       = new Float32Array(N);
+  const astuck   = new Int16Array(N);
+  const adelay   = new Int32Array(N);
+  const aturndir = new Int8Array(N);
+
+  function spawn(i) {
+    ax[i]      = 4 + Math.random() * 4;
+    ay[i]      = 10 + Math.random() * (H - 20);
+    aθ[i]      = (Math.random() - 0.5) * 0.6;   // mostly eastward
+    astuck[i]  = 0;
+    aturndir[i] = 0;
+  }
+  for (let i = 0; i < N; i++) { spawn(i); adelay[i] = i * SPAWN_ITV; }
+
+  function stepAnts() {
+    for (let i = 0; i < N; i++) {
+      if (adelay[i] > 0) { adelay[i]--; continue; }
+
+      const x = ax[i], y = ay[i];
+      let   θ = aθ[i];
+
+      // Goal: always east (right edge)
+      const goalX = W, goalY = ay[i];   // aim straight across at same height
+      const ga = Math.atan2(goalY - ay[i], goalX - ax[i]); // ≈ 0 (east)
+
+      // ── Normal steering — only when not hugging a wall ────────
+      if (astuck[i] === 0) {
+        const sL = sampleTrail(x+Math.cos(θ-SA)*SD, y+Math.sin(θ-SA)*SD);
+        const sC = sampleTrail(x+Math.cos(θ)*SD,    y+Math.sin(θ)*SD);
+        const sR = sampleTrail(x+Math.cos(θ+SA)*SD, y+Math.sin(θ+SA)*SD);
+
+        if      (sC >= sL && sC >= sR) θ += (Math.random()-0.5) * 0.10;
+        else if (sL > sR)              θ -= RA * (0.4 + Math.random()*0.6);
+        else if (sR > sL)              θ += RA * (0.4 + Math.random()*0.6);
+        else                           θ += (Math.random()<0.5?-1:1) * RA;
+
+        // Pull toward east
+        let dθ = ga - θ;
+        if (dθ >  Math.PI) dθ -= 2 * Math.PI;
+        if (dθ < -Math.PI) dθ += 2 * Math.PI;
+        θ += dθ * 0.06;
+      }
+
+      // ── Move + obstacle navigation ────────────────────────────
+      const nx = x + Math.cos(θ) * SPD;
+      const ny = y + Math.sin(θ) * SPD;
+
+      if (!isObs(nx, ny)) {
+        ax[i] = nx; ay[i] = ny;
+
+        if (astuck[i] > 0) {
+          // Exit wall mode when direct eastward path is clear
+          const look = SPD * 10;
+          if (!isObs(ax[i] + Math.cos(ga)*look, ay[i] + Math.sin(ga)*look)) {
+            astuck[i] = 0; aturndir[i] = 0;
+          } else {
+            astuck[i]++;
+            // Flip sides if heading too far away from east
+            let md = θ - ga;
+            if (md >  Math.PI) md -= 2 * Math.PI;
+            if (md < -Math.PI) md += 2 * Math.PI;
+            if (Math.abs(md) > Math.PI * 0.75 && astuck[i] % 45 === 0)
+              aturndir[i] = -aturndir[i];
+
+            // Gentle eastward pull even while wall-following
+            let dθw = ga - θ;
+            if (dθw >  Math.PI) dθw -= 2 * Math.PI;
+            if (dθw < -Math.PI) dθw += 2 * Math.PI;
+            θ += dθw * 0.025;
+          }
+        }
+      } else {
+        // Blocked — pick a side and slide along wall
+        if (aturndir[i] === 0) {
+          const leftA  = θ - Math.PI / 2;
+          const rightA = θ + Math.PI / 2;
+          const lOpen  = !isObs(x+Math.cos(leftA) *SPD, y+Math.sin(leftA) *SPD);
+          const rOpen  = !isObs(x+Math.cos(rightA)*SPD, y+Math.sin(rightA)*SPD);
+          const lScore = Math.cos(ga - leftA);
+          const rScore = Math.cos(ga - rightA);
+          if      ( lOpen && !rOpen) aturndir[i] = -1;
+          else if (!lOpen &&  rOpen) aturndir[i] =  1;
+          else if ( lOpen &&  rOpen) aturndir[i] = lScore >= rScore ? -1 : 1;
+          else                       aturndir[i] = Math.random()<0.5 ? -1 : 1;
+        }
+
+        const slideA = θ + aturndir[i] * Math.PI / 2;
+        const sx = x + Math.cos(slideA)*SPD, sy = y + Math.sin(slideA)*SPD;
+        if (!isObs(sx, sy)) {
+          ax[i] = sx; ay[i] = sy; θ = slideA;
+        } else {
+          const slideB = θ - aturndir[i] * Math.PI / 2;
+          const bx = x + Math.cos(slideB)*SPD, by = y + Math.sin(slideB)*SPD;
+          if (!isObs(bx, by)) { ax[i]=bx; ay[i]=by; θ=slideB; aturndir[i]=-aturndir[i]; }
+          else                 { θ += Math.PI; }
+        }
+
+        // Gentle eastward pull while sliding
+        let dθw = ga - θ;
+        if (dθw >  Math.PI) dθw -= 2 * Math.PI;
+        if (dθw < -Math.PI) dθw += 2 * Math.PI;
+        θ += dθw * 0.025;
+
+        astuck[i]++;
+        if (astuck[i] % 60 === 0) aturndir[i] = 0;
+      }
+
+      // Vertical clamp
+      if (ay[i] < 3)     { ay[i] = 3;     θ =  Math.abs(θ); }
+      if (ay[i] > H - 3) { ay[i] = H - 3; θ = -Math.abs(θ); }
+      aθ[i] = θ;
+
+      // Safety respawn if truly trapped
+      if (astuck[i] > MAX_STUCK) { spawn(i); adelay[i] = 10 + (Math.random()*20|0); continue; }
+
+      // Deposit trail
+      depositAt(ax[i], ay[i]);
+
+      // Exit right edge → respawn left
+      if (ax[i] > W - 4) { spawn(i); adelay[i] = SPAWN_ITV + (Math.random()*SPAWN_ITV|0); }
+    }
+
+    if (frame % 30 === 0) {
+      const active = N - Array.from(adelay).filter(d => d > 0).length;
+      document.getElementById('count').textContent = active + ' ants';
+    }
+  }
+
+  // ── Render ────────────────────────────────────────────────────
+  const phCv  = document.createElement('canvas');
+  phCv.width  = GW; phCv.height = GH;
+  const phCtx = phCv.getContext('2d');
+  const phImg = phCtx.createImageData(GW, GH);
+
+  const bgImg = new Image();
+  bgImg.src = 'ant_BG.png';
+
+  function renderBg() {
+    if (bgImg.complete && bgImg.naturalWidth) {
+      ctx.drawImage(bgImg, 0, 0, W, H);
+    } else {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(0, 0, W, H);
+    }
+    const d = phImg.data;
+    for (let i = 0; i < GW * GH; i++) {
+      const pi = i * 4;
+      if (obs[i]) {
+        d[pi] = 0xFF; d[pi+1] = 0xE8; d[pi+2] = 0x8E;
+        d[pi+3] = 255;
+      } else {
+        d[pi] = d[pi+1] = d[pi+2] = 0;
+        d[pi+3] = 0;
+      }
+    }
+    phCtx.putImageData(phImg, 0, 0);
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(phCv, 0, 0, W, H);
+  }
+
+  function drawAnts() {
+    ctx.fillStyle = ctx.strokeStyle = '#111';
+    ctx.lineCap = 'round';
+    for (let i = 0; i < N; i++) {
+      if (adelay[i] > 0) continue;
+      ctx.save();
+      ctx.translate(ax[i], ay[i]);
+      ctx.rotate(aθ[i]);
+      ctx.scale(1.331, 1.331);
+
+      ctx.fillStyle = '#111';
+      ctx.beginPath(); ctx.ellipse(-4.5, 0, 5.2, 3.4, 0, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse( 2.0, 0, 3.3, 2.5, 0, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(6.8, 0, 2.4, 0, Math.PI*2);               ctx.fill();
+
+      ctx.strokeStyle = '#111';
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(8.5,-0.5); ctx.lineTo(16,-7);
+      ctx.moveTo(8.5, 0.5); ctx.lineTo(16, 7);
+      ctx.stroke();
+
+      ctx.lineWidth = 0.8;
+      ctx.beginPath();
+      ctx.moveTo( 4.0,-2.3); ctx.lineTo( 2, -9);
+      ctx.moveTo( 4.0, 2.3); ctx.lineTo( 2,  9);
+      ctx.moveTo( 0.5,-2.3); ctx.lineTo(-2, -9);
+      ctx.moveTo( 0.5, 2.3); ctx.lineTo(-2,  9);
+      ctx.moveTo(-4.0,-2.1); ctx.lineTo(-6.5,-8);
+      ctx.moveTo(-4.0, 2.1); ctx.lineTo(-6.5, 8);
+      ctx.stroke();
+
+      ctx.restore();
+    }
+  }
+
+  // ── Input ─────────────────────────────────────────────────────
+  canvas.addEventListener('mousedown', e => {
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect();
+    if (e.button === 0) editObs(e.clientX-r.left, e.clientY-r.top, 1);
+    if (e.button === 2) editObs(e.clientX-r.left, e.clientY-r.top, 0);
+  });
+  canvas.addEventListener('mousemove', e => {
+    if (!e.buttons) return;
+    const r = canvas.getBoundingClientRect();
+    if (e.buttons & 1) editObs(e.clientX-r.left, e.clientY-r.top, 1);
+    if (e.buttons & 2) editObs(e.clientX-r.left, e.clientY-r.top, 0);
+  });
+  canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+  // ── Main loop ─────────────────────────────────────────────────
+  let frame = 0;
+  function loop() {
+    frame++;
+    stepTrail();
+    renderBg();
+    stepAnts();
+    drawAnts();
+    requestAnimationFrame(loop);
+  }
+  loop();
+  </script>
+</body>
+</html>
