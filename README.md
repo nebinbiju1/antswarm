@@ -2,7 +2,7 @@
 
 An interactive swarm-intelligence sandbox where 60 stigmergic ants lay and follow evaporating pheromone trails — drag to draw walls and watch emergent collective path-finding around obstacles.
 
-**[Try it live →](https://nebinbiju1.github.io/antswarm/)**
+**[Try it live →](http://nebinbiju.com/antswarm/)**
 
 ## Controls
 - **Drag** — draw walls
